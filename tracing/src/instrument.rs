@@ -11,6 +11,11 @@ use core::{
 };
 use pin_project_lite::pin_project;
 
+#[cfg(feature = "std")]
+type Dispatcher = Dispatch;
+#[cfg(not(feature = "std"))]
+type Dispatcher = ();
+
 /// Attaches spans to a [`std::future::Future`].
 ///
 /// Extension trait allowing futures to be
@@ -23,6 +28,11 @@ pub trait Instrument: Sized {
     ///
     /// The attached [`Span`] will be [entered] every time the instrumented
     /// [`Future`] is polled or [`Drop`]ped.
+    ///
+    /// The dispatcher associated with the span is also restored while the
+    /// future is polled or dropped. This ensures that spans and events created
+    /// by the future are recorded by the same subscriber, even if the future
+    /// is moved to another thread.
     ///
     /// # Examples
     ///
@@ -84,9 +94,17 @@ pub trait Instrument: Sized {
     /// [disabled]: super::Span::is_disabled()
     /// [`Future`]: std::future::Future
     fn instrument(self, span: Span) -> Instrumented<Self> {
+        #[cfg(feature = "std")]
+        let dispatcher = span
+            .dispatch()
+            .cloned()
+            .unwrap_or_else(|| dispatcher::get_default(|default| default.clone()));
+        #[cfg(not(feature = "std"))]
+        let dispatcher = ();
         Instrumented {
             inner: ManuallyDrop::new(self),
             span,
+            dispatcher,
         }
     }
 
@@ -95,6 +113,10 @@ pub trait Instrument: Sized {
     ///
     /// The attached [`Span`] will be [entered] every time the instrumented
     /// [`Future`] is polled or [`Drop`]ped.
+    ///
+    /// The current dispatcher is captured along with the span, so spans and
+    /// events created by the future are recorded by the same subscriber even
+    /// if the future is moved to another thread.
     ///
     /// This can be used to propagate the current span when spawning a new future.
     ///
@@ -269,10 +291,13 @@ pin_project! {
         #[pin]
         inner: ManuallyDrop<T>,
         span: Span,
+        dispatcher: Dispatcher,
     }
 
     impl<T> PinnedDrop for Instrumented<T> {
         fn drop(this: Pin<&mut Self>) {
+            #[cfg(feature = "std")]
+            let _default = dispatcher::set_default(&this.dispatcher);
             let this = this.project();
             let _enter = this.span.enter();
             // SAFETY: 1. `Pin::get_unchecked_mut()` is safe, because this isn't
@@ -297,6 +322,20 @@ impl<'a, T> InstrumentedProj<'a, T> {
         let inner = unsafe { self.inner.map_unchecked_mut(|v| &mut **v) };
         (self.span, inner)
     }
+
+    #[cfg(feature = "std")]
+    fn context_and_inner_pin_mut(self) -> (&'a Span, &'a Dispatch, Pin<&'a mut T>) {
+        let InstrumentedProj {
+            inner,
+            span,
+            dispatcher,
+        } = self;
+        // SAFETY: As long as `ManuallyDrop<T>` does not move, `T` won't move
+        //         and `inner` is valid, because `ManuallyDrop::drop` is called
+        //         only inside `Drop` of the `Instrumented`.
+        let inner = unsafe { inner.map_unchecked_mut(|v| &mut **v) };
+        (span, dispatcher, inner)
+    }
 }
 
 impl<'a, T> InstrumentedProjRef<'a, T> {
@@ -316,7 +355,12 @@ impl<T: Future> Future for Instrumented<T> {
     type Output = T::Output;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        #[cfg(feature = "std")]
+        let (span, dispatcher, inner) = self.project().context_and_inner_pin_mut();
+        #[cfg(not(feature = "std"))]
         let (span, inner) = self.project().span_and_inner_pin_mut();
+        #[cfg(feature = "std")]
+        let _default = dispatcher::set_default(dispatcher);
         let _enter = span.enter();
         inner.poll(cx)
     }
@@ -372,10 +416,14 @@ impl<T> Instrumented<T> {
         let this = ManuallyDrop::new(self);
         let span: *const Span = &this.span;
         let inner: *const ManuallyDrop<T> = &this.inner;
+        #[cfg(feature = "std")]
+        let dispatcher: *const Dispatch = &this.dispatcher;
         // SAFETY: Those pointers are valid for reads, because `Drop` didn't
         //         run, and properly aligned, because `Instrumented` isn't
         //         `#[repr(packed)]`.
         let _span = unsafe { span.read() };
+        #[cfg(feature = "std")]
+        let _dispatcher = unsafe { dispatcher.read() };
         let inner = unsafe { inner.read() };
         ManuallyDrop::into_inner(inner)
     }

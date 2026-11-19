@@ -561,6 +561,11 @@ impl Span {
         })
     }
 
+    #[cfg(feature = "std")]
+    pub(crate) fn dispatch(&self) -> Option<&Dispatch> {
+        self.inner.as_ref().map(|inner| &inner.subscriber)
+    }
+
     fn make_with(
         meta: &'static Metadata<'static>,
         new_span: Attributes<'_>,
